@@ -2308,33 +2308,56 @@ class Router:
         """
         Race on first token arrival for streaming mode.
 
-        Instead of picking the winner when the SSE connection is established
-        (HTTP 200 headers), wait until each stream produces its first content
-        chunk and pick the stream that delivers it first.
+        Two-phase approach to ensure fair racing:
+        Phase 1: Establish all stream connections concurrently so HTTP
+                 requests are all in-flight before any token reading.
+        Phase 2: Race on first token arrival across all established streams.
+
+        Without phase separation, asyncio's cooperative scheduling gives
+        the first task a head start (50-100ms of sync setup in acompletion),
+        causing the first model to always win regardless of actual TTFT.
         """
 
-        async def _get_first_chunk(
-            model: str, **kw: Any
-        ) -> Union[tuple, Exception]:
-            """Get stream and its first chunk. Returns (stream, first_chunk) or Exception."""
+        # Phase 1: Establish all streams concurrently
+        async def _create_stream(model: str, **kw: Any):
             try:
-                stream_obj = await self.acompletion(
+                return await self.acompletion(
                     model=model, messages=messages, stream=True, **kw
                 )
-                # Read until we get the first chunk
-                async for chunk in stream_obj:
-                    return (stream_obj, chunk)
-                return Exception(f"Stream for {model} ended without producing chunks")
+            except Exception as e:
+                return e
+
+        stream_tasks = [
+            asyncio.create_task(_create_stream(model=m, **kwargs))
+            for m in models
+        ]
+        stream_results = await asyncio.gather(*stream_tasks, return_exceptions=True)
+
+        # Collect successfully established streams
+        streams: List[CustomStreamWrapper] = []
+        for result in stream_results:
+            if isinstance(result, CustomStreamWrapper):
+                streams.append(result)
+
+        if not streams:
+            raise Exception("All tasks failed: no stream could be established")
+
+        # Phase 2: Race on first token across all established streams
+        async def _read_first_chunk(
+            stream: CustomStreamWrapper,
+        ) -> Union[tuple, Exception]:
+            try:
+                async for chunk in stream:
+                    return (stream, chunk)
+                return Exception("Stream ended without producing chunks")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 return e
 
         pending_tasks: List[asyncio.Task] = []
-        for m in models:
-            task = asyncio.create_task(
-                _get_first_chunk(model=m, **kwargs)
-            )
+        for s in streams:
+            task = asyncio.create_task(_read_first_chunk(s))
             pending_tasks.append(task)
 
         while pending_tasks:
@@ -2349,7 +2372,7 @@ class Router:
                     continue
                 if isinstance(result, tuple):
                     winning_stream, first_chunk = result
-                    # Cancel all other racing tasks
+                    # Cancel all other token-reading tasks
                     for t in pending_tasks:
                         t.cancel()
 
