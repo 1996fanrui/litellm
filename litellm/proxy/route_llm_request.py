@@ -220,6 +220,15 @@ async def route_request(  # noqa: PLR0915 - Complex routing function, refactorin
     Common helper to route the request
     """
     add_shared_session_to_data(data)
+    if "," in data.get("model", ""):
+        from litellm._logging import verbose_proxy_logger
+        verbose_proxy_logger.warning(
+            f"[ROUTE_DEBUG] model={data.get('model','')[:80]}, "
+            f"api_key_in_data={'api_key' in data}, "
+            f"api_base_in_data={'api_base' in data}, "
+            f"fastest_response={data.get('fastest_response')}, "
+            f"route_type={route_type}"
+        )
 
     team_id = get_team_id_from_data(data)
     router_model_names = llm_router.model_names if llm_router is not None else []

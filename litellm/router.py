@@ -2308,56 +2308,30 @@ class Router:
         """
         Race on first token arrival for streaming mode.
 
-        Two-phase approach to ensure fair racing:
-        Phase 1: Establish all stream connections concurrently so HTTP
-                 requests are all in-flight before any token reading.
-        Phase 2: Race on first token arrival across all established streams.
-
-        Without phase separation, asyncio's cooperative scheduling gives
-        the first task a head start (50-100ms of sync setup in acompletion),
-        causing the first model to always win regardless of actual TTFT.
+        Each task independently establishes its stream and reads the first
+        token. The first task to produce a token wins.
         """
 
-        # Phase 1: Establish all streams concurrently
-        async def _create_stream(model: str, **kw: Any):
-            try:
-                return await self.acompletion(
-                    model=model, messages=messages, stream=True, **kw
-                )
-            except Exception as e:
-                return e
-
-        stream_tasks = [
-            asyncio.create_task(_create_stream(model=m, **kwargs))
-            for m in models
-        ]
-        stream_results = await asyncio.gather(*stream_tasks, return_exceptions=True)
-
-        # Collect successfully established streams
-        streams: List[CustomStreamWrapper] = []
-        for result in stream_results:
-            if isinstance(result, CustomStreamWrapper):
-                streams.append(result)
-
-        if not streams:
-            raise Exception("All tasks failed: no stream could be established")
-
-        # Phase 2: Race on first token across all established streams
-        async def _read_first_chunk(
-            stream: CustomStreamWrapper,
+        async def _get_first_chunk(
+            model: str, **kw: Any
         ) -> Union[tuple, Exception]:
             try:
-                async for chunk in stream:
-                    return (stream, chunk)
-                return Exception("Stream ended without producing chunks")
+                stream_obj = await self.acompletion(
+                    model=model, messages=messages, stream=True, **kw
+                )
+                async for chunk in stream_obj:
+                    return (stream_obj, chunk)
+                return Exception(f"Stream for {model} ended without producing chunks")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 return e
 
         pending_tasks: List[asyncio.Task] = []
-        for s in streams:
-            task = asyncio.create_task(_read_first_chunk(s))
+        for m in models:
+            task = asyncio.create_task(
+                _get_first_chunk(model=m, **kwargs)
+            )
             pending_tasks.append(task)
 
         while pending_tasks:
@@ -2372,12 +2346,9 @@ class Router:
                     continue
                 if isinstance(result, tuple):
                     winning_stream, first_chunk = result
-                    # Cancel all other token-reading tasks
                     for t in pending_tasks:
                         t.cancel()
 
-                    # Build a wrapper that yields the consumed first chunk
-                    # followed by the rest of the winning stream
                     async def _prepend_first_chunk(first, rest):
                         yield first
                         async for c in rest:
@@ -2391,7 +2362,6 @@ class Router:
                         custom_llm_provider=winning_stream.custom_llm_provider,
                         logging_obj=winning_stream.logging_obj,
                     )
-                    # Copy hidden params from the winning stream
                     wrapper._hidden_params = winning_stream._hidden_params
                     wrapper._hidden_params[
                         "fastest_response_batch_completion"
