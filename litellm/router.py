@@ -2237,72 +2237,137 @@ class Router:
         model - List of comma-separated model names. E.g. model="gpt-4, gpt-3.5-turbo"
 
         Returns fastest response from list of model names. OpenAI-compatible endpoint.
+
+        For non-streaming: races on full response completion (correct behavior).
+        For streaming: races on first token arrival (TTFT), not HTTP connection.
         """
         models = [m.strip() for m in model.split(",")]
 
-        async def _async_completion_no_exceptions(
-            model: str, messages: List[Dict[str, str]], stream: bool, **kwargs: Any
-        ) -> Union[ModelResponse, CustomStreamWrapper, Exception]:
-            """
-            Wrapper around self.acompletion that catches exceptions and returns them as a result
-            """
+        if stream:
+            return await self._abatch_completion_fastest_response_streaming(
+                models=models, messages=messages, **kwargs
+            )
+        else:
+            return await self._abatch_completion_fastest_response_non_streaming(
+                models=models, messages=messages, **kwargs
+            )
+
+    async def _abatch_completion_fastest_response_non_streaming(
+        self,
+        models: List[str],
+        messages: List[Dict[str, str]],
+        **kwargs,
+    ) -> ModelResponse:
+        """Race on full response completion for non-streaming mode."""
+
+        async def _completion_no_exceptions(
+            model: str, **kw: Any
+        ) -> Union[ModelResponse, Exception]:
             try:
-                result = await self.acompletion(model=model, messages=messages, stream=stream, **kwargs)  # type: ignore
-                return result
-            except asyncio.CancelledError:
-                verbose_router_logger.debug(
-                    "Received 'task.cancel'. Cancelling call w/ model={}.".format(model)
+                return await self.acompletion(
+                    model=model, messages=messages, stream=False, **kw
                 )
+            except asyncio.CancelledError:
                 raise
             except Exception as e:
                 return e
 
-        pending_tasks = []  # type: ignore
-
-        async def check_response(task: asyncio.Task):
-            nonlocal pending_tasks
-            try:
-                result = await task
-                if isinstance(result, (ModelResponse, CustomStreamWrapper)):
-                    verbose_router_logger.debug(
-                        "Received successful response. Cancelling other LLM API calls."
-                    )
-                    # If a desired response is received, cancel all other pending tasks
-                    for t in pending_tasks:
-                        t.cancel()
-                    return result
-            except Exception:
-                # Ignore exceptions, let the loop handle them
-                pass
-            finally:
-                # Remove the task from pending tasks if it finishes
-                try:
-                    pending_tasks.remove(task)
-                except KeyError:
-                    pass
-
-        for model in models:
+        pending_tasks: List[asyncio.Task] = []
+        for m in models:
             task = asyncio.create_task(
-                _async_completion_no_exceptions(
-                    model=model, messages=messages, stream=stream, **kwargs
-                )
+                _completion_no_exceptions(model=m, **kwargs)
             )
             pending_tasks.append(task)
 
-        # Await the first task to complete successfully
         while pending_tasks:
-            done, pending_tasks = await asyncio.wait(  # type: ignore
+            done, pending_set = await asyncio.wait(
                 pending_tasks, return_when=asyncio.FIRST_COMPLETED
             )
+            pending_tasks = list(pending_set)
             for completed_task in done:
-                result = await check_response(completed_task)
-
-                if result is not None:
-                    # Return the first successful result
-                    result._hidden_params["fastest_response_batch_completion"] = True
+                try:
+                    result = await completed_task
+                except Exception:
+                    continue
+                if isinstance(result, ModelResponse):
+                    for t in pending_tasks:
+                        t.cancel()
+                    result._hidden_params[
+                        "fastest_response_batch_completion"
+                    ] = True
                     return result
 
-        # If we exit the loop without returning, all tasks failed
+        raise Exception("All tasks failed")
+
+    async def _abatch_completion_fastest_response_streaming(
+        self,
+        models: List[str],
+        messages: List[Dict[str, str]],
+        **kwargs,
+    ) -> CustomStreamWrapper:
+        """
+        Race on first token arrival for streaming mode.
+
+        Each task independently establishes its stream and reads the first
+        token. The first task to produce a token wins.
+        """
+
+        async def _get_first_chunk(
+            model: str, **kw: Any
+        ) -> Union[tuple, Exception]:
+            try:
+                stream_obj = await self.acompletion(
+                    model=model, messages=messages, stream=True, **kw
+                )
+                async for chunk in stream_obj:
+                    return (stream_obj, chunk)
+                return Exception(f"Stream for {model} ended without producing chunks")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                return e
+
+        pending_tasks: List[asyncio.Task] = []
+        for m in models:
+            task = asyncio.create_task(
+                _get_first_chunk(model=m, **kwargs)
+            )
+            pending_tasks.append(task)
+
+        while pending_tasks:
+            done, pending_set = await asyncio.wait(
+                pending_tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            pending_tasks = list(pending_set)
+            for completed_task in done:
+                try:
+                    result = await completed_task
+                except Exception:
+                    continue
+                if isinstance(result, tuple):
+                    winning_stream, first_chunk = result
+                    for t in pending_tasks:
+                        t.cancel()
+
+                    async def _prepend_first_chunk(first, rest):
+                        yield first
+                        async for c in rest:
+                            yield c
+
+                    wrapper = CustomStreamWrapper(
+                        completion_stream=_prepend_first_chunk(
+                            first_chunk, winning_stream
+                        ),
+                        model=winning_stream.model,
+                        custom_llm_provider=winning_stream.custom_llm_provider,
+                        logging_obj=winning_stream.logging_obj,
+                    )
+                    wrapper._hidden_params = winning_stream._hidden_params
+                    wrapper._hidden_params[
+                        "fastest_response_batch_completion"
+                    ] = True
+                    return wrapper
+
         raise Exception("All tasks failed")
 
     ### SCHEDULER ###
