@@ -3,8 +3,8 @@
 ## 问题描述
 
 1. **竞速永远是第一个 model 赢**：无论 model 列表顺序如何，litellm 的 `fastest_response: true` 竞速总是第一个 model 获胜，不是真正的竞速
-2. **Web UI 展示问题**：litellm Web UI 的 request logs 永远显示第一个 model，无法验证竞速结果
-3. **延迟不符合预期**：如果第一个 model 是最慢的 provider，整体延迟应该由最快的 provider 决定，但实际延迟由第一个 model 决定
+2. **streaming 模式 overhead 过高**：streaming 竞速路径比 non-streaming 多 ~150ms 开销，来自 litellm acompletion 的同步路由处理被串行调度。对于 P99.99 < 800ms 的延迟目标，150ms 本地开销不可接受
+3. **Web UI 展示问题**：litellm Web UI 的 request logs 无法验证竞速结果
 
 ## 验证标准
 
@@ -14,16 +14,16 @@
 
 | 模型名 | Server 端 Sleep | 预期行为 |
 |--------|----------------|----------|
-| mock-slow (第1个) | 3.0s | 不应该赢 |
-| mock-medium (第2个) | 2.7s | 不应该赢 |
-| mock-fast (第3个) | 2.4s | 应该永远赢 |
+| mock-slow (随机位置) | 360ms | 不应该赢 |
+| mock-medium (随机位置) | 330ms | 不应该赢 |
+| mock-fast (随机位置) | 300ms | 应该永远赢 |
 
 ### 必须满足的验证点
 
-1. **正确的 winner**：无论 model 列表顺序如何，mock-fast（sleep 2.4s）永远赢
-2. **正确的延迟**：总耗时约 2.4s（+ 少量本地网络开销），绝不能达到 2.7s
-3. **Web UI 展示**：litellm Web UI 的 request logs 显示赢家是 mock-fast
-4. **streaming 和 non-streaming 都要测试**：两种模式都必须满足以上标准
+1. **正确的 winner**：100 轮测试，每轮随机排列 3 个模型顺序，mock-fast 100% 获胜
+2. **正确的延迟**：总耗时 < 329ms（300ms + 最多 29ms 开销），绝不能达到 330ms
+3. **streaming 和 non-streaming 都要测试**：两种模式都必须满足以上标准
+4. **100 轮全部通过**：不允许有任何失败
 
 ### 约束
 

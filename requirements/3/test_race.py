@@ -1,91 +1,120 @@
 #!/usr/bin/env python3
-"""Test fastest_response racing with mock models.
+"""Test fastest_response racing - 100 rounds, random order, strict timing.
 
-Expects mock-slow(3.0s), mock-medium(2.7s), mock-fast(2.4s).
-Validates: mock-fast always wins, latency ~2.4s, never reaches 2.7s.
+mock-slow=360ms, mock-medium=330ms, mock-fast=300ms.
+Requirement: mock-fast always wins, total time < 329ms.
+Non-streaming and streaming tests run in parallel.
 """
 
 import asyncio
+import random
 import time
 from openai import AsyncOpenAI
 
 LITELLM_URL = "http://localhost:31750/v1"
 LITELLM_KEY = "sk-123456"
-# slow is first in list - should NOT win
-MODEL_LIST = "mock-slow, mock-medium, mock-fast"
+MODELS = ["mock-slow", "mock-medium", "mock-fast"]
+MAX_TIME_MS = 329
+ROUNDS = 100
 
-async def test_non_streaming():
-    client = AsyncOpenAI(base_url=LITELLM_URL, api_key=LITELLM_KEY)
-    start = time.time()
-    resp = await client.chat.completions.create(
-        model=MODEL_LIST,
-        messages=[{"role": "user", "content": "test"}],
-        max_tokens=10,
-        stream=False,
-        extra_body={"fastest_response": True},
-    )
-    elapsed = time.time() - start
-    content = resp.choices[0].message.content
-    model = resp.model
-    return elapsed, content, model
 
-async def test_streaming():
-    client = AsyncOpenAI(base_url=LITELLM_URL, api_key=LITELLM_KEY)
+async def race(client, models_str, stream):
     start = time.time()
-    stream = await client.chat.completions.create(
-        model=MODEL_LIST,
-        messages=[{"role": "user", "content": "test"}],
-        max_tokens=10,
-        stream=True,
-        extra_body={"fastest_response": True},
-    )
-    tokens = []
-    model = None
-    async for chunk in stream:
-        if not model:
-            model = chunk.model
-        if chunk.choices and chunk.choices[0].delta.content:
-            tokens.append(chunk.choices[0].delta.content)
-    elapsed = time.time() - start
-    content = "".join(tokens)
-    return elapsed, content, model
+    if stream:
+        s = await client.chat.completions.create(
+            model=models_str,
+            messages=[{"role": "user", "content": "t"}],
+            max_tokens=5, stream=True,
+            extra_body={"fastest_response": True},
+        )
+        content = ""
+        async for chunk in s:
+            if chunk.choices and chunk.choices[0].delta.content:
+                content += chunk.choices[0].delta.content
+    else:
+        resp = await client.chat.completions.create(
+            model=models_str,
+            messages=[{"role": "user", "content": "t"}],
+            max_tokens=5, stream=False,
+            extra_body={"fastest_response": True},
+        )
+        content = resp.choices[0].message.content
+    elapsed_ms = (time.time() - start) * 1000
+    return elapsed_ms, content
+
+
+async def run_mode(mode):
+    """Run 100 sequential rounds for one mode. Returns result dict."""
+    stream = mode == "streaming"
+    client = AsyncOpenAI(base_url=LITELLM_URL, api_key=LITELLM_KEY)
+
+    # Warmup: 1 request to eliminate cold start
+    await race(client, ", ".join(MODELS), stream)
+
+    wins = {"mock-slow": 0, "mock-medium": 0, "mock-fast": 0, "unknown": 0}
+    times = []
+    failures = []
+
+    for i in range(ROUNDS):
+        order = MODELS[:]
+        random.shuffle(order)
+        models_str = ", ".join(order)
+        elapsed_ms, content = await race(client, models_str, stream)
+        times.append(elapsed_ms)
+
+        winner = "unknown"
+        for m in MODELS:
+            if m in content:
+                winner = m
+                break
+        wins[winner] += 1
+
+        ok_winner = winner == "mock-fast"
+        ok_time = elapsed_ms < MAX_TIME_MS
+        if not ok_winner or not ok_time:
+            failures.append(
+                f"  Run {i+1}: order={order}, winner={winner}, time={elapsed_ms:.0f}ms"
+            )
+
+    times.sort()
+    return {
+        "mode": mode, "wins": wins, "times": times,
+        "failures": failures,
+        "p50": times[49], "p99": times[98], "max": times[99],
+    }
+
 
 async def main():
     print("=" * 60)
-    print("FASTEST_RESPONSE RACE TEST (mock models)")
-    print(f"Model order: {MODEL_LIST}")
-    print(f"Expected winner: mock-fast (2.4s)")
+    print(f"  FASTEST_RESPONSE RACE TEST")
+    print(f"  {ROUNDS} rounds per mode, random order, limit {MAX_TIME_MS}ms")
+    print(f"  Models: slow=360ms, medium=330ms, fast=300ms")
+    print(f"  Running non-streaming and streaming in parallel...")
     print("=" * 60)
 
+    # Run both modes in parallel (each internally sequential)
+    results = await asyncio.gather(
+        run_mode("non-streaming"),
+        run_mode("streaming"),
+    )
+
     all_pass = True
-
-    # Non-streaming tests
-    print("\n--- Non-Streaming Tests ---")
-    for i in range(3):
-        elapsed, content, model = await test_non_streaming()
-        winner_ok = "mock-fast" in content
-        time_ok = elapsed < 2.7
-        status = "PASS" if (winner_ok and time_ok) else "FAIL"
-        if status == "FAIL":
+    for r in results:
+        print(f"\n--- {r['mode'].upper()} ---")
+        print(f"  Winners: slow={r['wins']['mock-slow']}, medium={r['wins']['mock-medium']}, fast={r['wins']['mock-fast']}")
+        print(f"  Latency: p50={r['p50']:.0f}ms, p99={r['p99']:.0f}ms, max={r['max']:.0f}ms")
+        print(f"  Failures: {len(r['failures'])}/{ROUNDS}")
+        if r['failures']:
             all_pass = False
-        print(f"  Run {i+1}: {status} | time={elapsed:.2f}s | content={content!r} | model={model}")
-
-    # Streaming tests
-    print("\n--- Streaming Tests ---")
-    for i in range(3):
-        elapsed, content, model = await test_streaming()
-        winner_ok = "mock-fast" in content
-        time_ok = elapsed < 2.7
-        status = "PASS" if (winner_ok and time_ok) else "FAIL"
-        if status == "FAIL":
-            all_pass = False
-        print(f"  Run {i+1}: {status} | time={elapsed:.2f}s | content={content!r} | model={model}")
+            for f in r['failures'][:10]:
+                print(f)
+            if len(r['failures']) > 10:
+                print(f"  ... and {len(r['failures'])-10} more")
+        else:
+            print(f"  ALL {ROUNDS} ROUNDS PASSED")
 
     print("\n" + "=" * 60)
-    if all_pass:
-        print("RESULT: ALL TESTS PASSED")
-    else:
-        print("RESULT: SOME TESTS FAILED")
+    print(f"  RESULT: {'ALL TESTS PASSED' if all_pass else 'SOME TESTS FAILED'}")
     print("=" * 60)
 
 asyncio.run(main())

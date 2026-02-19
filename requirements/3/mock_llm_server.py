@@ -3,9 +3,9 @@
 
 Usage: python3 mock_llm_server.py
 Serves on port 29990 with 3 models:
-  - mock-slow:   3.0s delay
-  - mock-medium: 2.7s delay
-  - mock-fast:   2.4s delay
+  - mock-slow:   360ms delay
+  - mock-medium: 330ms delay
+  - mock-fast:   300ms delay
 """
 
 import asyncio
@@ -14,16 +14,16 @@ import time
 from aiohttp import web
 
 MODEL_DELAYS = {
-    "mock-slow": 3.0,
-    "mock-medium": 2.7,
-    "mock-fast": 2.4,
+    "mock-slow": 0.36,
+    "mock-medium": 0.33,
+    "mock-fast": 0.30,
 }
 
 async def chat_completions(request):
     data = await request.json()
     model = data.get("model", "unknown")
     stream = data.get("stream", False)
-    delay = MODEL_DELAYS.get(model, 1.0)
+    delay = MODEL_DELAYS.get(model, 0.3)
 
     await asyncio.sleep(delay)
 
@@ -32,31 +32,17 @@ async def chat_completions(request):
         response.content_type = "text/event-stream"
         await response.prepare(request)
 
-        # First chunk with role
         chunk1 = {
-            "id": f"mock-{model}-{int(time.time())}",
+            "id": f"mock-{model}-{int(time.time()*1000)}",
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": f"Hello from {model}!"}, "finish_reason": None}]
         }
         await response.write(f"data: {json.dumps(chunk1)}\n\n".encode())
 
-        # Content chunks
-        for word in ["Hello", " from", f" {model}!"]:
-            chunk = {
-                "id": f"mock-{model}-{int(time.time())}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {"content": word}, "finish_reason": None}]
-            }
-            await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
-            await asyncio.sleep(0.05)
-
-        # Final chunk
         final = {
-            "id": f"mock-{model}-{int(time.time())}",
+            "id": f"mock-{model}-{int(time.time()*1000)}",
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": model,
@@ -67,7 +53,7 @@ async def chat_completions(request):
         return response
     else:
         result = {
-            "id": f"mock-{model}-{int(time.time())}",
+            "id": f"mock-{model}-{int(time.time()*1000)}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model,
